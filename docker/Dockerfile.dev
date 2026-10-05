@@ -1,0 +1,12 @@
+# Development image: source is bind-mounted by docker-compose, tsx restarts on change.
+FROM node:24-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY . .
+
+EXPOSE 3000
+CMD ["npm", "run", "dev"]
