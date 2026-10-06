@@ -32,26 +32,75 @@ three fronts:
 
 ## 💡 The Solution
 
-```
-data/students.csv (500k lines, 48 MB)
-        │
-        ▼
-fs.createReadStream()            ← reads 64 KB chunks on demand
-        │  pipeline()
-        ▼
-csv-parser (Transform)           ← one object per line; BOM/CRLF/quotes handled
-        │
-        ▼  for await...of        ← BACKPRESSURE: while a batch is being inserted the loop is
-        │                          suspended → parser buffer fills → file stream pauses
-Student.create(row)              ← Domain validation through Value Objects
-        │                          (Email, StudentName, Score, enrollment date, course id)
-        ├── ✅ valid ──► batch[] ──(1,000 rows)──► duplicate check ──► INSERT IGNORE … VALUES (…),(…)
-        │
-        └── ❌ invalid ──► output/errors-<timestamp>.csv   (streamed to disk, line by line)
+```mermaid
+flowchart TD
+    subgraph INGESTION["1. Stream Ingestion & Backpressure"]
+        CSV["📄 data/students.csv<br/>(500k rows / 48 MB)"]
+        FS["🌊 fs.createReadStream()<br/>(64 KB chunks)"]
+        PARSER["⚙️ csv-parser (Transform Stream)<br/>(BOM, CRLF & quotes handled)"]
+        LOOP{"🔄 for await...of Loop<br/>(Automatic Backpressure)"}
+    end
+
+    subgraph DOMAIN["2. Domain Boundary & Validation"]
+        CREATE["🏛️ Student.create(row)<br/>Domain Entity & Value Objects"]
+        VO_EMAIL["✉️ Email (normalized)"]
+        VO_NAME["👤 StudentName"]
+        VO_SCORE["📊 Score (0-100)"]
+        RESULT{"⚖️ Result&lt;Student, DomainError&gt;"}
+    end
+
+    subgraph ERROR_PIPELINE["3. Audit & Error Isolation"]
+        ERR_WRITER["📝 CsvErrorReportWriter<br/>(CSV-injection safe stream)"]
+        ERR_FILE[("🛑 output/errors-timestamp.csv<br/>(Line #, Field, Value, Reason)")]
+    end
+
+    subgraph BATCHING["4. Batch Accumulation & Uniqueness"]
+        BUFFER["📦 Memory Batch Buffer<br/>(Max 1,000 students)"]
+        UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...)"]
+        SPLIT{"Duplicate Check"}
+    end
+
+    subgraph PERSISTENCE["5. MySQL 8 Storage Engine"]
+        BULK["🚀 Bulk INSERT IGNORE<br/>UUID v7 Primary Keys (Append-only)"]
+        INNODB[("🗄️ MySQL 8 InnoDB<br/>Clustered Index B+ Tree")]
+    end
+
+    CSV --> FS
+    FS -->|stream chunks| PARSER
+    PARSER -->|async iterable| LOOP
+    LOOP --> CREATE
+    CREATE -.-> VO_EMAIL & VO_NAME & VO_SCORE
+    CREATE --> RESULT
+
+    RESULT -->|❌ Invalid Row| ERR_WRITER
+    ERR_WRITER --> ERR_FILE
+
+    RESULT -->|✅ Valid Student| BUFFER
+    BUFFER -->|Batch Full (1,000 rows) or EOF| UNIQ
+    UNIQ --> SPLIT
+
+    SPLIT -->|❌ Duplicate in file / DB| ERR_WRITER
+    SPLIT -->|✅ Unique Rows| BULK
+    BULK --> INNODB
+
+    BULK -.->|await Promise resolves<br/>Resumes stream reading| LOOP
+
+    classDef source fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
+    classDef domain fill:#0f172a,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
+    classDef error fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#fca5a5;
+    classDef batch fill:#1e1b4b,stroke:#06b6d4,stroke-width:2px,color:#f8fafc;
+    classDef storage fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#d1fae5;
+
+    class CSV,FS,PARSER,LOOP source;
+    class CREATE,VO_EMAIL,VO_NAME,VO_SCORE,RESULT domain;
+    class ERR_WRITER,ERR_FILE error;
+    class BUFFER,UNIQ,SPLIT batch;
+    class BULK,INNODB storage;
 ```
 
 Memory is bounded by **one chunk + one batch**, whatever the file size. Invalid rows never reach
 the database, and every rejected field is reported with its line number.
+*(Para os diagramas de sequência detalhados e mapa hexagonal de camadas, consulte [`docs/architecture.md`](docs/architecture.md)).*
 
 ## 🏗️ Architecture
 
