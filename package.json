@@ -19,6 +19,7 @@
     "generate": "tsx scripts/generate-csv.ts",
     "seed": "tsx scripts/seed.ts",
     "benchmark": "tsx benchmarks/sync-vs-stream.ts",
+    "benchmark:uuid": "tsx benchmarks/uuid-v4-vs-v7.ts",
     "test": "jest",
     "test:unit": "jest --selectProjects unit",
     "test:int": "jest --selectProjects integration",
