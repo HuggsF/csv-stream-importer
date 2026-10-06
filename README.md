@@ -34,18 +34,18 @@ three fronts:
 
 ```mermaid
 flowchart TD
-    subgraph INGESTION["1. Stream Ingestion & Backpressure"]
+    subgraph INGESTION["1. Stream Ingestion & Backpressure — ADR-001"]
         CSV["📄 data/students.csv<br/>(500k rows / 48 MB)"]
-        FS["🌊 fs.createReadStream()<br/>(64 KB chunks)"]
+        FS["🌊 fs.createReadStream()<br/>(64 KB chunks on demand)"]
         PARSER["⚙️ csv-parser (Transform Stream)<br/>(BOM, CRLF & quotes handled)"]
         LOOP{"🔄 for await...of Loop<br/>(Automatic Backpressure)"}
     end
 
-    subgraph DOMAIN["2. Domain Boundary & Validation"]
+    subgraph DOMAIN["2. Domain Boundary & Validation — ADR-003"]
         CREATE["🏛️ Student.create(row)<br/>Domain Entity & Value Objects"]
         VO_EMAIL["✉️ Email (normalized)"]
-        VO_NAME["👤 StudentName"]
-        VO_SCORE["📊 Score (0-100)"]
+        VO_NAME["👤 StudentName (2-100 chars)"]
+        VO_SCORE["📊 Score (0-100, 2 decimals)"]
         RESULT{"⚖️ Result&lt;Student, DomainError&gt;"}
     end
 
@@ -54,14 +54,14 @@ flowchart TD
         ERR_FILE[("🛑 output/errors-timestamp.csv<br/>(Line #, Field, Value, Reason)")]
     end
 
-    subgraph BATCHING["4. Batch Accumulation & Uniqueness"]
-        BUFFER["📦 Memory Batch Buffer<br/>(Max 1,000 students)"]
-        UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...)"]
+    subgraph BATCHING["4. Batch Accumulation & Uniqueness — ADR-002 / ADR-005"]
+        BUFFER["📦 Memory Batch Buffer<br/>(Max 1,000 students — ADR-002)"]
+        UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...) — ADR-005"]
         SPLIT{"Duplicate Check"}
     end
 
-    subgraph PERSISTENCE["5. MySQL 8 Storage Engine"]
-        BULK["🚀 Bulk INSERT IGNORE<br/>UUID v7 Primary Keys (Append-only)"]
+    subgraph PERSISTENCE["5. MySQL 8 Storage Engine — ADR-002 / ADR-004"]
+        BULK["🚀 Bulk INSERT IGNORE<br/>UUID v7 Primary Keys (Append-only — ADR-002)"]
         INNODB[("🗄️ MySQL 8 InnoDB<br/>Clustered Index B+ Tree")]
     end
 
@@ -98,8 +98,7 @@ flowchart TD
     class BULK,INNODB storage;
 ```
 
-Memory is bounded by **one chunk + one batch**, whatever the file size. Invalid rows never reach
-the database, and every rejected field is reported with its line number.
+Memory is bounded by **one chunk + one batch**, whatever the file size (under 80 MB RSS — [ADR-004](docs/adr/004-memory-budget-and-heap-tuning.md)). Invalid rows never reach the database, and every rejected field is reported with its line number.
 *(Para os diagramas de sequência detalhados e mapa hexagonal de camadas, consulte [`docs/architecture.md`](docs/architecture.md)).*
 
 ## 🏗️ Architecture
@@ -107,6 +106,60 @@ the database, and every rejected field is reported with its line number.
 **Clean Architecture + DDD + TypeScript (strict)** — dependencies always point inward, and the
 rule is **enforced by ESLint** (`no-restricted-imports` per layer: the Domain cannot import
 anything outside itself, the Application cannot import frameworks or outer layers).
+
+```mermaid
+graph TD
+    subgraph PRESENTATION["Presentation Layer"]
+        CLI["CLI (Commander)<br/>import, migrate"]
+        HTTP["HTTP API (Express 5)<br/>POST /api/import, /health"]
+    end
+
+    subgraph INFRASTRUCTURE["Infrastructure Layer (Adapters)"]
+        DB_REPO["MySqlStudentRepository<br/>(Knex / mysql2)"]
+        CSV_READER["CsvParserStreamReader<br/>(fs.createReadStream)"]
+        REPORT_WRITER["CsvErrorReportWriter<br/>(Stream to disk)"]
+        PINO_LOG["Pino Logger<br/>(JSON structured)"]
+        QUEUE["InProcessImportJobQueue<br/>(Bounded concurrency)"]
+    end
+
+    subgraph APPLICATION["Application Layer (Use Cases & Ports)"]
+        UC_IMPORT["ImportStudentsUseCase"]
+        UC_JOB["Start / ProcessImportJobUseCase"]
+        PORTS_REPO["StudentRepository (Port)"]
+        PORTS_CSV["CsvStreamReader (Port)"]
+        PORTS_WRITER["ErrorReportWriter (Port)"]
+    end
+
+    subgraph DOMAIN["Domain Layer (Zero External Dependencies)"]
+        ENTITY["Entities: Student, ImportJob"]
+        VO["Value Objects: Email, StudentName, Score, FilePath"]
+        SERVICE["Services: StudentUniquenessService"]
+        RESULT["Shared: Result&lt;T, E&gt;"]
+        ERRORS["DomainError Hierarchy"]
+    end
+
+    CLI --> UC_IMPORT
+    HTTP --> UC_JOB
+    UC_IMPORT --> PORTS_REPO
+    UC_IMPORT --> PORTS_CSV
+    UC_IMPORT --> PORTS_WRITER
+    UC_IMPORT --> DOMAIN
+    UC_JOB --> DOMAIN
+
+    DB_REPO -.->|implements| PORTS_REPO
+    CSV_READER -.->|implements| PORTS_CSV
+    REPORT_WRITER -.->|implements| PORTS_WRITER
+
+    classDef pres fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
+    classDef infra fill:#1f2937,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+    classDef app fill:#111827,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+    classDef dom fill:#030712,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
+
+    class CLI,HTTP pres;
+    class DB_REPO,CSV_READER,REPORT_WRITER,PINO_LOG,QUEUE infra;
+    class UC_IMPORT,UC_JOB,PORTS_REPO,PORTS_CSV,PORTS_WRITER app;
+    class ENTITY,VO,SERVICE,RESULT,ERRORS dom;
+```
 
 ```
 src/
@@ -135,17 +188,17 @@ src/
     └── http/               # Express 5: streaming multipart upload, job status, /health
 ```
 
-### Key technical decisions
+### Key technical decisions & Architecture Decisions Records (ADRs)
 
-| Decision | Rationale | ADR |
-|---|---|---|
-| Streams over `readFileSync` | Flat memory, Event Loop stays free, backpressure via `for await` | [ADR-001](docs/adr/001-streams-over-readfile.md) |
-| Batches of 1,000 rows | 99.9 % fewer round-trips than row-by-row; conservative, configurable default | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
-| Result pattern | Expected failures are typed return values, not exceptions | [ADR-003](docs/adr/003-result-pattern.md) |
-| Heap budget (`--max-old-space-size=64`) | Live heap is 16 MB; capping V8 keeps RSS < 80 MB at the same speed | [ADR-004](docs/adr/004-memory-budget-and-heap-tuning.md) |
-| Uniqueness checked per batch | Catches duplicates across the whole file with O(batch) memory | [ADR-005](docs/adr/005-email-uniqueness-with-bounded-memory.md) |
-| Value Objects for validation | Invalid data cannot exist past the Domain boundary | — |
-| UUID v7 primary keys | Time-ordered keys append to the InnoDB clustered index | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
+| Componente no Diagrama | Decisão Técnica | Rationale de Arquitetura | ADR Vinculado |
+|---|---|---|:---:|
+| **1. Ingestion** | Streams over `readFileSync` | Memória constante, Event Loop desimpedido, backpressure via `for await` | [ADR-001](docs/adr/001-streams-over-readfile.md) |
+| **2. Domain** | Result Pattern | Falhas esperadas retornadas como tipos discriminados seguros (`Result<T, E>`) em vez de exceptions | [ADR-003](docs/adr/003-result-pattern.md) |
+| **2. Domain** | Value Objects para Validação | Imutabilidade e garantia de invariantes antes de qualquer I/O de banco | — |
+| **4. Batching** | Lotes de 1.000 linhas | 99.9% menos round-trips que inserção linha a linha; default configurável | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
+| **4. Batching** | Unicidade com Memória $O(\text{batch})$ | Lookahead indexado de emails por lote sem guardar Set global de 500k itens | [ADR-005](docs/adr/005-email-uniqueness-with-bounded-memory.md) |
+| **5. Persistence** | UUID v7 (RFC 9562) | Chaves sequenciais no tempo preservando ordenação física no Clustered Index (InnoDB) sem page split | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
+| **Pipeline Global** | Heap Budget (`--max-old-space-size=64`) | Heap ativo de ~16 MB; V8 limitado mantém RSS < 80 MB com a mesma velocidade | [ADR-004](docs/adr/004-memory-budget-and-heap-tuning.md) |
 
 ## 📊 Benchmarks
 

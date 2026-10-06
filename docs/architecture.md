@@ -10,14 +10,14 @@ O diagrama abaixo ilustra o fluxo ponta a ponta desde a leitura física do arqui
 
 ```mermaid
 flowchart TD
-    subgraph INGESTION["1. Stream Ingestion & Backpressure"]
+    subgraph INGESTION["1. Stream Ingestion & Backpressure (ADR-001)"]
         CSV["📄 data/students.csv<br/>(500k rows / 48 MB)"]
         FS["🌊 fs.createReadStream()<br/>(Chunks de 64 KB sob demanda)"]
         PARSER["⚙️ csv-parser (Transform Stream)<br/>(BOM, CRLF & aspas normalizados)"]
         LOOP{"🔄 for await...of Loop<br/>(Backpressure Reativo)"}
     end
 
-    subgraph DOMAIN["2. Domain Boundary & Validation"]
+    subgraph DOMAIN["2. Domain Boundary & Validation (ADR-003)"]
         CREATE["🏛️ Student.create(row)<br/>Domain Entity & Value Objects"]
         VO_EMAIL["✉️ Email (Normalizado & Validado)"]
         VO_NAME["👤 StudentName (2-100 chars)"]
@@ -30,15 +30,15 @@ flowchart TD
         ERR_FILE[("🛑 output/errors-timestamp.csv<br/>(Linha, Campo, Valor, Motivo)")]
     end
 
-    subgraph BATCHING["4. Acumulação em Lote & Unicidade"]
-        BUFFER["📦 Buffer em Memória<br/>(Lote delimitado: 1.000 alunos)"]
-        UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...)"]
+    subgraph BATCHING["4. Acumulação em Lote & Unicidade (ADR-002 / ADR-005)"]
+        BUFFER["📦 Buffer em Memória<br/>(Lote delimitado: 1.000 alunos — ADR-002)"]
+        UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...) — ADR-005"]
         SPLIT{"Checagem de Duplicidade"}
     end
 
-    subgraph PERSISTENCE["5. MySQL 8 Storage Engine"]
-        BULK["🚀 Bulk INSERT IGNORE<br/>UUID v7 Primary Keys (Append-only)"]
-        INNODB[("🗄️ MySQL 8 InnoDB<br/>Clustered Index B+ Tree")]
+    subgraph PERSISTENCE["5. MySQL 8 Storage Engine (ADR-002 / ADR-004)"]
+        BULK["🚀 Bulk INSERT IGNORE<br/>UUID v7 Primary Keys (Append-only — ADR-002)"]
+        INNODB[("🗄️ MySQL 8 InnoDB<br/>Clustered Index B+ Tree — ADR-004")]
     end
 
     CSV --> FS
