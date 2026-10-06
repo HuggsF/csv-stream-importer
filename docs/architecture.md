@@ -9,69 +9,70 @@
 O diagrama abaixo ilustra o fluxo ponta a ponta desde a leitura física do arquivo CSV até a gravação final no MySQL 8 InnoDB, destacando os mecanismos de **Backpressure**, **Validação no Domínio**, **Tratamento de Duplicidades** e **Isolamento de Erros**.
 
 ```mermaid
-flowchart TD
-    subgraph INGESTION["1. Stream Ingestion & Backpressure (ADR-001)"]
-        CSV["📄 data/students.csv<br/>(500k rows / 48 MB)"]
-        FS["🌊 fs.createReadStream()<br/>(Chunks de 64 KB sob demanda)"]
-        PARSER["⚙️ csv-parser (Transform Stream)<br/>(BOM, CRLF & aspas normalizados)"]
-        LOOP{"🔄 for await...of Loop<br/>(Backpressure Reativo)"}
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Inter, Segoe UI, Helvetica, Arial, sans-serif", "fontSize": "15px", "lineColor": "#64748B", "primaryTextColor": "#0F172A", "clusterBkg": "#F8FAFC", "clusterBorder": "#CBD5E1", "titleColor": "#0F172A", "edgeLabelBackground": "#FFFFFF"}, "flowchart": {"curve": "basis", "nodeSpacing": 34, "rankSpacing": 40, "padding": 12, "wrappingWidth": 320}}}%%
+flowchart TB
+    CSV[("📄 students.csv · 500 mil linhas · 48 MB")]
+
+    subgraph S1["① Ingestão via stream · ADR-001"]
+        FS("fs.createReadStream → csv-parser<br/><i>blocos de 64 KB, lidos sob demanda</i>")
+        LOOP{{"for await…of · uma linha por vez"}}
+        FS --> LOOP
     end
 
-    subgraph DOMAIN["2. Domain Boundary & Validation (ADR-003)"]
-        CREATE["🏛️ Student.create(row)<br/>Domain Entity & Value Objects"]
-        VO_EMAIL["✉️ Email (Normalizado & Validado)"]
-        VO_NAME["👤 StudentName (2-100 chars)"]
-        VO_SCORE["📊 Score (0-100, 2 casas)"]
-        RESULT{"⚖️ Result&lt;Student, DomainError&gt;"}
+    subgraph S2["② Validação no domínio · ADR-003"]
+        CREATE[["Student.create(row)<br/><i>Email · StudentName · Score · data · curso</i>"]]
+        VALID{{"Result‹Student›"}}
+        CREATE --> VALID
     end
 
-    subgraph ERROR_PIPELINE["3. Auditoria & Isolamento de Erros"]
-        ERR_WRITER["📝 CsvErrorReportWriter<br/>(Stream seguro contra CSV-injection)"]
-        ERR_FILE[("🛑 output/errors-timestamp.csv<br/>(Linha, Campo, Valor, Motivo)")]
+    subgraph S3["③ Lote e unicidade · ADR-002 · ADR-005"]
+        BATCH("Buffer do lote · até 1.000 alunos")
+        LOOKUP("findExistingEmails<br/><i>1 SELECT indexado … WHERE email IN (…)</i>")
+        UNIQ{{"Unicidade · a primeira ocorrência vence"}}
+        BATCH -->|"cheio ou EOF"| LOOKUP --> UNIQ
     end
 
-    subgraph BATCHING["4. Acumulação em Lote & Unicidade (ADR-002 / ADR-005)"]
-        BUFFER["📦 Buffer em Memória<br/>(Lote delimitado: 1.000 alunos — ADR-002)"]
-        UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...) — ADR-005"]
-        SPLIT{"Checagem de Duplicidade"}
+    subgraph S4["④ Persistência · ADR-002"]
+        INSERT("INSERT IGNORE … VALUES (…),(…)<br/><i>1 statement por lote · chaves UUID v7</i>")
+        DB[("🗄️ MySQL 8 · InnoDB")]
+        INSERT --> DB
     end
 
-    subgraph PERSISTENCE["5. MySQL 8 Storage Engine (ADR-002 / ADR-004)"]
-        BULK["🚀 Bulk INSERT IGNORE<br/>UUID v7 Primary Keys (Append-only — ADR-002)"]
-        INNODB[("🗄️ MySQL 8 InnoDB<br/>Clustered Index B+ Tree — ADR-004")]
+    subgraph S5["Relatório de erros"]
+        REPORT("CsvErrorReportWriter<br/><i>em stream · protegido contra CSV injection</i>")
+        ERRORS[("🧾 output/errors-‹timestamp›.csv")]
+        REPORT --> ERRORS
     end
 
     CSV --> FS
-    FS --> PARSER
-    PARSER --> LOOP
     LOOP --> CREATE
-    CREATE -.-> VO_EMAIL & VO_NAME & VO_SCORE
-    CREATE --> RESULT
+    VALID -->|"✔ válida"| BATCH
+    VALID -->|"✘ inválida"| REPORT
+    UNIQ -->|"✔ única"| INSERT
+    UNIQ -->|"✘ duplicada"| REPORT
+    LOOP -.-|"⏸ aguarda cada flush · buffer do parser enche · o stream pausa"| INSERT
 
-    RESULT -->|Linha Invalida| ERR_WRITER
-    ERR_WRITER --> ERR_FILE
+    classDef io fill:#E0F2FE,stroke:#0284C7,stroke-width:1.5px,color:#0C4A6E
+    classDef domain fill:#EDE9FE,stroke:#7C3AED,stroke-width:1.5px,color:#2E1065
+    classDef batch fill:#FEF3C7,stroke:#D97706,stroke-width:1.5px,color:#451A03
+    classDef store fill:#DCFCE7,stroke:#16A34A,stroke-width:1.5px,color:#052E16
+    classDef error fill:#FEE2E2,stroke:#DC2626,stroke-width:1.5px,color:#450A0A
 
-    RESULT -->|Aluno Valido| BUFFER
-    BUFFER -->|Lote de 1000 ou Fim do Arquivo| UNIQ
-    UNIQ --> SPLIT
+    class CSV,FS,LOOP io
+    class CREATE,VALID domain
+    class BATCH,LOOKUP,UNIQ batch
+    class INSERT,DB store
+    class REPORT,ERRORS error
 
-    SPLIT -->|Duplicado no arquivo ou banco| ERR_WRITER
-    SPLIT -->|Alunos Unicos| BULK
-    BULK --> INNODB
+    style S1 fill:#F0F9FF,stroke:#7DD3FC,color:#0C4A6E
+    style S2 fill:#F5F3FF,stroke:#C4B5FD,color:#2E1065
+    style S3 fill:#FFFBEB,stroke:#FCD34D,color:#451A03
+    style S4 fill:#F0FDF4,stroke:#86EFAC,color:#052E16
+    style S5 fill:#FEF2F2,stroke:#FCA5A5,color:#450A0A
 
-    BULK -.->|Promise resolvida: retoma leitura| LOOP
-
-    classDef source fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
-    classDef domain fill:#0f172a,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
-    classDef error fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#fca5a5;
-    classDef batch fill:#1e1b4b,stroke:#06b6d4,stroke-width:2px,color:#f8fafc;
-    classDef storage fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#d1fae5;
-
-    class CSV,FS,PARSER,LOOP source;
-    class CREATE,VO_EMAIL,VO_NAME,VO_SCORE,RESULT domain;
-    class ERR_WRITER,ERR_FILE error;
-    class BUFFER,UNIQ,SPLIT batch;
-    class BULK,INNODB storage;
+    linkStyle 8,10 stroke:#16A34A,stroke-width:2px
+    linkStyle 9,11 stroke:#DC2626,stroke-width:2px
+    linkStyle 12 stroke:#D97706,stroke-width:2px,stroke-dasharray:6 4
 ```
 
 ---
@@ -81,53 +82,60 @@ flowchart TD
 O diagrama abaixo detalha a coordenação temporal e o controle de fluxo entre a leitura de disco, o Event Loop do Node.js e o banco de dados MySQL:
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Inter, Segoe UI, Helvetica, Arial, sans-serif", "fontSize": "15px", "actorBkg": "#EEF2FF", "actorBorder": "#6366F1", "actorTextColor": "#1E1B4B", "actorLineColor": "#94A3B8", "signalColor": "#475569", "signalTextColor": "#0F172A", "labelBoxBkgColor": "#F1F5F9", "labelBoxBorderColor": "#94A3B8", "labelTextColor": "#0F172A", "loopTextColor": "#334155", "noteBkgColor": "#FEF3C7", "noteBorderColor": "#D97706", "noteTextColor": "#451A03", "activationBkgColor": "#E0E7FF", "activationBorderColor": "#6366F1", "sequenceNumberColor": "#FFFFFF"}}}%%
 sequenceDiagram
     autonumber
-    actor CLI as Usuário / CLI
-    participant FS as fs.createReadStream
-    participant Parser as csv-parser (Transform)
-    participant UC as ImportStudentsUseCase
-    participant Domain as Student (Domain)
-    participant Repo as MySqlStudentRepository
-    participant DB as MySQL 8 InnoDB
+    actor U as 👤 CLI / job HTTP
+    box rgb(240, 249, 255) Infraestrutura · leitura
+        participant R as CsvParserStreamReader
+    end
+    box rgb(245, 243, 255) Núcleo · Application + Domain
+        participant UC as ImportStudentsUseCase
+        participant D as Student.create
+    end
+    box rgb(240, 253, 244) Infraestrutura · persistência
+        participant Repo as MySqlStudentRepository
+        participant DB as MySQL 8
+    end
+    box rgb(254, 242, 242) Infraestrutura · auditoria
+        participant E as Relatório de erros
+    end
 
-    CLI->>UC: execute({ filePath, batchSize: 1000 })
-    UC->>FS: Inicia leitura (64 KB chunks)
-    FS->>Parser: Pipe chunks de bytes
-    Parser-->>UC: Emite linhas parseadas (Async Iterable)
+    U->>+UC: execute({ filePath, batchSize: 1000 })
+    UC->>R: read(filePath)
+    Note over R: createReadStream → csv-parser<br/>lê blocos de 64 KB só quando há demanda
 
-    loop Para cada linha do CSV
-        UC->>Domain: Student.create(row)
-        alt Linha Válida
-            Domain-->>UC: Result.ok(Student)
-            UC->>UC: batch.push(Student)
-        else Linha Inválida
-            Domain-->>UC: Result.fail(DomainError)
-            UC->>UC: reportWriter.writeError(line, error)
+    loop for await…of — uma linha por vez
+        R-->>UC: { lineNumber, name, email, … }
+        UC->>D: Student.create(row)
+        alt linha válida
+            D-->>UC: ok(Student)
+            UC->>UC: batch.push(student)
+        else linha inválida
+            D-->>UC: fail(InvalidStudentError)
+            UC-)E: write() · 1 linha por campo inválido
         end
 
-        opt Quando batch.length === 1000
-            Note over UC,FS: BACKPRESSURE ATIVADO: Loop assíncrono aguarda I/O.<br/>O buffer do parser atinge highWaterMark e o fs stream pausa.
-            UC->>Repo: findExistingEmails(batchEmails)
-            Repo->>DB: SELECT email FROM students WHERE email IN (...)
-            DB-->>Repo: Emails já registrados
-            Repo-->>UC: Set com emails existentes
-            UC->>UC: Particiona lote (identifica duplicados)
-            UC->>Repo: bulkInsert(validBatch)
-            Repo->>DB: INSERT IGNORE INTO students VALUES (... 1.000 linhas ...)
-            DB-->>Repo: affectedRows: 1000
-            Repo-->>UC: Confirma inserção
-            UC->>UC: batch.clear()
-            Note over UC,FS: BACKPRESSURE LIBERADO: Promise resolvida.<br/>O stream volta a ler mais 64 KB do disco.
+        opt batch.length = 1.000
+            rect rgb(255, 251, 235)
+                Note over R,UC: BACKPRESSURE · o loop aguarda o flush, o buffer do parser<br/>atinge o highWaterMark e o fs stream para de ler o disco
+                UC->>+Repo: findExistingEmails(1.000 e-mails)
+                Repo->>DB: SELECT email … WHERE email IN (…)
+                DB-->>Repo: e-mails já cadastrados
+                Repo-->>-UC: Set‹email›
+                UC->>UC: StudentUniquenessService.partition()
+                UC-)E: duplicados → relatório
+                UC->>+Repo: bulkInsert(únicos)
+                Repo->>DB: INSERT IGNORE … VALUES (…), (…)
+                DB-->>Repo: affectedRows
+                Repo-->>-UC: linhas inseridas
+                Note over R,UC: Promise resolvida · o loop volta a puxar linhas e o stream retoma
+            end
         end
     end
 
-    opt Lote Residual (< 1.000 linhas no EOF)
-        UC->>Repo: bulkInsert(residualBatch)
-        Repo->>DB: INSERT IGNORE INTO students VALUES (...)
-    end
-
-    UC-->>CLI: ImportStudentsOutput (total, importados, rejeitados, duração, memória)
+    UC->>Repo: flush do lote residual (EOF)
+    UC-->>-U: ImportStudentsOutput · processadas, importadas, rejeitadas, duração, pico de memória
 ```
 
 ---
@@ -137,67 +145,121 @@ sequenceDiagram
 O projeto segue estritamente os princípios da **Clean Architecture** e **Domain-Driven Design**. As dependências apontam exclusivamente para o centro (Domain), regra validada em tempo de compilação e garantida pelo ESLint (`no-restricted-imports`):
 
 ```mermaid
-graph TD
-    subgraph PRESENTATION["Presentation Layer"]
-        CLI["CLI (Commander)<br/>import, migrate"]
-        HTTP["HTTP API (Express 5)<br/>POST /api/import, /health"]
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Inter, Segoe UI, Helvetica, Arial, sans-serif", "fontSize": "15px", "lineColor": "#64748B", "primaryTextColor": "#0F172A", "clusterBkg": "#F8FAFC", "clusterBorder": "#CBD5E1", "titleColor": "#0F172A", "edgeLabelBackground": "#FFFFFF"}, "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 60, "padding": 14, "wrappingWidth": 260}}}%%
+flowchart LR
+    subgraph IN["🚪 Presentation · adaptadores de entrada"]
+        direction TB
+        CLI("CLI · commander<br/><i>import · migrate</i>")
+        HTTP("HTTP · Express 5<br/><i>upload · status do job · /health</i>")
     end
 
-    subgraph INFRASTRUCTURE["Infrastructure Layer"]
-        DB_REPO["MySqlStudentRepository<br/>(Knex / mysql2)"]
-        CSV_READER["CsvParserStreamReader<br/>(Streams / Pipeline)"]
-        REPORT_WRITER["CsvErrorReportWriter<br/>(Escrita segura em disco)"]
-        PINO_LOG["Pino Logger<br/>(JSON estruturado)"]
-        QUEUE["InProcessImportJobQueue<br/>(Concorrência limitada)"]
+    subgraph APP["⚙️ Application · casos de uso"]
+        direction TB
+        UC1("ImportStudentsUseCase")
+        UC2("Start / ProcessImportJobUseCase")
+        UC3("GetImportJobStatus · CheckHealth")
     end
 
-    subgraph APPLICATION["Application Layer (Use Cases & Ports)"]
-        UC_IMPORT["ImportStudentsUseCase"]
-        UC_JOB["Start / ProcessImportJobUseCase"]
-        PORTS_REPO["StudentRepository (Port)"]
-        PORTS_CSV["CsvStreamReader (Port)"]
-        PORTS_WRITER["ErrorReportWriter (Port)"]
+    subgraph CORE["💎 Domain · zero dependências"]
+        direction TB
+        D1["Student · ImportJob"]
+        D2["Email · StudentName · Score · FilePath"]
+        D3["StudentUniquenessService"]
+        D4["Result‹T, E› · DomainError"]
     end
 
-    subgraph DOMAIN["Domain Layer (Zero Dependências)"]
-        ENTITY["Entities: Student, ImportJob"]
-        VO["Value Objects: Email, StudentName, Score, FilePath"]
-        SERVICE["Services: StudentUniquenessService"]
-        RESULT["Shared: Result&lt;T, E&gt;"]
-        ERRORS["DomainError Hierarchy"]
+    subgraph PORTS["🔌 Ports · interfaces definidas pelo núcleo"]
+        direction TB
+        P1["StudentRepository"]
+        P2["CsvStreamReader"]
+        P3["ErrorReportWriter"]
+        P4["ImportJobQueue"]
+        P5["Logger · Clock · IdGenerator"]
     end
 
-    CLI --> UC_IMPORT
-    HTTP --> UC_JOB
-    UC_IMPORT --> PORTS_REPO
-    UC_IMPORT --> PORTS_CSV
-    UC_IMPORT --> PORTS_WRITER
-    UC_IMPORT --> DOMAIN
-    UC_JOB --> DOMAIN
+    subgraph OUT["🔧 Infrastructure · adaptadores de saída"]
+        direction TB
+        A1("MySqlStudentRepository<br/><i>knex · mysql2</i>")
+        A2("CsvParserStreamReader<br/><i>fs streams · csv-parser</i>")
+        A3("CsvErrorReportWriter<br/><i>CSV em stream</i>")
+        A4("InProcessImportJobQueue<br/><i>concorrência limitada</i>")
+        A5("pino · SystemClock · UUID v7")
+    end
 
-    DB_REPO -.->|Implementa| PORTS_REPO
-    CSV_READER -.->|Implementa| PORTS_CSV
-    REPORT_WRITER -.->|Implementa| PORTS_WRITER
+    CLI --> UC1
+    HTTP --> UC2
+    HTTP --> UC3
+    APP ==>|usa| CORE
+    APP -->|depende de| PORTS
+    P1 -.-|implementado por| A1
+    P2 -.- A2
+    P3 -.- A3
+    P4 -.- A4
+    P5 -.- A5
 
-    classDef pres fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
-    classDef infra fill:#1f2937,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
-    classDef app fill:#111827,stroke:#10b981,stroke-width:2px,color:#f8fafc;
-    classDef dom fill:#030712,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
+    classDef pres fill:#E0F2FE,stroke:#0284C7,stroke-width:1.5px,color:#0C4A6E
+    classDef app fill:#DCFCE7,stroke:#16A34A,stroke-width:1.5px,color:#052E16
+    classDef dom fill:#EDE9FE,stroke:#7C3AED,stroke-width:1.5px,color:#2E1065
+    classDef port fill:#FFFFFF,stroke:#7C3AED,stroke-width:1.5px,stroke-dasharray:4 3,color:#2E1065
+    classDef infra fill:#FEF3C7,stroke:#D97706,stroke-width:1.5px,color:#451A03
 
-    class CLI,HTTP pres;
-    class DB_REPO,CSV_READER,REPORT_WRITER,PINO_LOG,QUEUE infra;
-    class UC_IMPORT,UC_JOB,PORTS_REPO,PORTS_CSV,PORTS_WRITER app;
-    class ENTITY,VO,SERVICE,RESULT,ERRORS dom;
+    class CLI,HTTP pres
+    class UC1,UC2,UC3 app
+    class D1,D2,D3,D4 dom
+    class P1,P2,P3,P4,P5 port
+    class A1,A2,A3,A4,A5 infra
+
+    style IN fill:#F0F9FF,stroke:#7DD3FC,color:#0C4A6E
+    style APP fill:#F0FDF4,stroke:#86EFAC,color:#052E16
+    style CORE fill:#F5F3FF,stroke:#C4B5FD,color:#2E1065
+    style PORTS fill:#FAF5FF,stroke:#D8B4FE,color:#2E1065
+    style OUT fill:#FFFBEB,stroke:#FCD34D,color:#451A03
 ```
 
 ---
 
-## 4. Garantias de Performance e Recursos
+## 4. Ciclo de Vida do Job de Importação (API HTTP)
+
+Uploads recebidos em `POST /api/import` viram um `ImportJob` processado em background por uma fila em processo com concorrência e backlog limitados. As transições são invariantes da entidade — transições inválidas retornam `InvalidImportJobTransitionError`:
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Inter, Segoe UI, Helvetica, Arial, sans-serif", "fontSize": "15px", "lineColor": "#64748B", "primaryColor": "#E0F2FE", "primaryBorderColor": "#0284C7", "primaryTextColor": "#0C4A6E", "edgeLabelBackground": "#FFFFFF", "transitionLabelColor": "#334155"}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> pending: POST /api/import → 202
+    pending --> processing: a fila inicia o job
+    pending --> failed: fila cheia · shutdown
+    processing --> completed: relatório gerado
+    processing --> failed: falha de infraestrutura
+    completed --> [*]
+    failed --> [*]
+
+    classDef waiting fill:#FEF3C7,stroke:#D97706,stroke-width:1.5px,color:#451A03
+    classDef running fill:#E0F2FE,stroke:#0284C7,stroke-width:1.5px,color:#0C4A6E
+    classDef ok fill:#DCFCE7,stroke:#16A34A,stroke-width:1.5px,color:#052E16
+    classDef ko fill:#FEE2E2,stroke:#DC2626,stroke-width:1.5px,color:#450A0A
+
+    class pending waiting
+    class processing running
+    class completed ok
+    class failed ko
+```
+
+| Transição | Quem dispara |
+|---|---|
+| `pending → processing` | `InProcessImportJobQueue` inicia o `ProcessImportJobUseCase` |
+| `pending → failed` | fila cheia (`503` + `Retry-After`), ou shutdown antes do início |
+| `processing → completed` | importação concluída (inclusive abortada por `SIGTERM` após o lote corrente) |
+| `processing → failed` | falha de infraestrutura (MySQL fora do ar, stream corrompido…) |
+
+---
+
+## 5. Garantias de Performance e Recursos
 
 | Mecanismo | Problema Evitado | Garantia Técnica |
 |---|---|---|
 | **Backpressure Automático** | Out of Memory (OOM) | O consumo do stream é suspenso enquanto a Promise de inserção no MySQL é resolvida. O arquivo só é lido conforme o banco consegue gravar. |
-| **Memória $O(\text{batch})$** | Alocação linear com o tamanho do arquivo | A memória utilizada permanece estável em **~78 MB RSS** (heap ativo de ~16 MB), seja para 100 linhas ou 50.000.000 de linhas. |
-| **Bulk INSERT (1.000 linhas)** | 500.000 round-trips e gargalo de rede | Reduz os round-trips em 99.9% (~500 statements no total) atingindo taxa de **8.470 linhas/segundo**. |
-| **UUID v7 (RFC 9562)** | Page Splitting e fragmentação no InnoDB | IDs gerados com prefixo temporal de 48 bits resultam em append sequencial na ponta da árvore B+, mantendo alto índice de ocupação de página e eliminando rebalanceamento. |
+| **Memória $O(\text{batch})$** | Alocação linear com o tamanho do arquivo | A memória não cresce com o tamanho do arquivo: na importação de 500 mil linhas o pico foi de **78,7 MB RSS**, com heap vivo de ~16 MB (medido com GC forçado — [ADR-004](adr/004-memory-budget-and-heap-tuning.md)). |
+| **Bulk INSERT (1.000 linhas)** | 500.000 round-trips e gargalo de rede | ~500 INSERTs em lote (+ ~500 SELECTs de unicidade) no lugar de 500.000 statements, atingindo **8.470 linhas/segundo**. |
+| **UUID v7 (RFC 9562)** | Page splits e fragmentação no InnoDB | IDs com prefixo temporal de 48 bits são inseridos em ordem crescente no fim da árvore B+ do índice clusterizado, reduzindo page splits em relação ao UUID v4 aleatório (`npm run benchmark:uuid`). |
 | **Isolamento de Erros via Stream** | Falhas silenciosas e injeção de fórmulas | Linhas rejeitadas são descarregadas em disco linha a linha no formato CSV, com escape contra CSV Injection para caracteres perigosos (`=`, `+`, `-`, `@`). |

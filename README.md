@@ -7,7 +7,7 @@
 [![Node.js](https://img.shields.io/badge/Node.js-22.22%2B-green?logo=node.js)](https://nodejs.org/)
 [![MySQL](https://img.shields.io/badge/MySQL-8-orange?logo=mysql)](https://www.mysql.com/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-blue?logo=docker)](https://docs.docker.com/compose/)
-[![Tests](https://img.shields.io/badge/tests-224%20passing-brightgreen)](#-tests)
+[![Tests](https://img.shields.io/badge/tests-231%20passing-brightgreen)](#-tests)
 [![Coverage](https://img.shields.io/badge/coverage-96%25-brightgreen)](#-tests)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -26,80 +26,83 @@ three fronts:
 |---|---|---|---|
 | `readFileSync` + `forEach` | ❌ frozen for the whole parse | ❌ grows with the file (590 MB for 48 MB of CSV) | — |
 | … + one `INSERT` per row | ❌ | ❌ | ❌ 500,000 round-trips (126 rows/s) |
-| **Stream + validate + batched bulk `INSERT`** | ✅ longest block 54 ms | ✅ **78.7 MB, flat** | ✅ ~500 statements (8,470 rows/s) |
+| **Stream + validate + batched bulk `INSERT`** | ✅ longest block 54 ms | ✅ **78.7 MB, flat** | ✅ ~500 bulk INSERTs (8,470 rows/s) |
 
 *All numbers measured on this repository — see [Benchmarks](#-benchmarks).*
 
 ## 💡 The Solution
 
 ```mermaid
-flowchart TD
-    subgraph INGESTION["1. Stream Ingestion & Backpressure — ADR-001"]
-        CSV["📄 data/students.csv<br/>500k rows / 48 MB"]
-        FS["🌊 fs.createReadStream()<br/>64 KB chunks on demand"]
-        PARSER["⚙️ csv-parser (Transform Stream)<br/>BOM, CRLF & quotes handled"]
-        LOOP{"🔄 for await...of Loop<br/>Automatic Backpressure"}
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Inter, Segoe UI, Helvetica, Arial, sans-serif", "fontSize": "15px", "lineColor": "#64748B", "primaryTextColor": "#0F172A", "clusterBkg": "#F8FAFC", "clusterBorder": "#CBD5E1", "titleColor": "#0F172A", "edgeLabelBackground": "#FFFFFF"}, "flowchart": {"curve": "basis", "nodeSpacing": 34, "rankSpacing": 40, "padding": 12, "wrappingWidth": 320}}}%%
+flowchart TB
+    CSV[("📄 students.csv · 500k rows · 48 MB")]
+
+    subgraph S1["① Stream ingestion · ADR-001"]
+        FS("fs.createReadStream → csv-parser<br/><i>64 KB chunks, read on demand</i>")
+        LOOP{{"for await…of · one row at a time"}}
+        FS --> LOOP
     end
 
-    subgraph DOMAIN["2. Domain Boundary & Validation — ADR-003"]
-        CREATE["🏛️ Student.create(row)<br/>Domain Entity & Value Objects"]
-        VO_EMAIL["✉️ Email (normalized)"]
-        VO_NAME["👤 StudentName (2-100 chars)"]
-        VO_SCORE["📊 Score (0-100, 2 decimals)"]
-        RESULT{"⚖️ Result&lt;Student, DomainError&gt;"}
+    subgraph S2["② Domain validation · ADR-003"]
+        CREATE[["Student.create(row)<br/><i>Email · StudentName · Score · date · course</i>"]]
+        VALID{{"Result‹Student›"}}
+        CREATE --> VALID
     end
 
-    subgraph ERROR_PIPELINE["3. Audit & Error Isolation"]
-        ERR_WRITER["📝 CsvErrorReportWriter<br/>CSV-injection safe stream"]
-        ERR_FILE[("🛑 output/errors-timestamp.csv<br/>Line #, Field, Value, Reason")]
+    subgraph S3["③ Batch & uniqueness · ADR-002 · ADR-005"]
+        BATCH("Batch buffer · up to 1,000 students")
+        LOOKUP("findExistingEmails<br/><i>1 indexed SELECT … WHERE email IN (…)</i>")
+        UNIQ{{"Uniqueness · first occurrence wins"}}
+        BATCH -->|"full or EOF"| LOOKUP --> UNIQ
     end
 
-    subgraph BATCHING["4. Batch Accumulation & Uniqueness — ADR-002 / ADR-005"]
-        BUFFER["📦 Memory Batch Buffer<br/>Max 1,000 students — ADR-002"]
-        UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...) — ADR-005"]
-        SPLIT{"Duplicate Check"}
+    subgraph S4["④ Persistence · ADR-002"]
+        INSERT("INSERT IGNORE … VALUES (…),(…)<br/><i>1 statement per batch · UUID v7 keys</i>")
+        DB[("🗄️ MySQL 8 · InnoDB")]
+        INSERT --> DB
     end
 
-    subgraph PERSISTENCE["5. MySQL 8 Storage Engine — ADR-002 / ADR-004"]
-        BULK["🚀 Bulk INSERT IGNORE<br/>UUID v7 Primary Keys (Append-only — ADR-002)"]
-        INNODB[("🗄️ MySQL 8 InnoDB<br/>Clustered Index B+ Tree")]
+    subgraph S5["Error report"]
+        REPORT("CsvErrorReportWriter<br/><i>streamed · CSV-injection safe</i>")
+        ERRORS[("🧾 output/errors-‹timestamp›.csv")]
+        REPORT --> ERRORS
     end
 
     CSV --> FS
-    FS --> PARSER
-    PARSER --> LOOP
     LOOP --> CREATE
-    CREATE -.-> VO_EMAIL & VO_NAME & VO_SCORE
-    CREATE --> RESULT
+    VALID -->|"✔ valid"| BATCH
+    VALID -->|"✘ invalid"| REPORT
+    UNIQ -->|"✔ unique"| INSERT
+    UNIQ -->|"✘ duplicate"| REPORT
+    LOOP -.-|"⏸ awaits each flush · parser buffer fills · file stream pauses"| INSERT
 
-    RESULT -->|Invalid Row| ERR_WRITER
-    ERR_WRITER --> ERR_FILE
+    classDef io fill:#E0F2FE,stroke:#0284C7,stroke-width:1.5px,color:#0C4A6E
+    classDef domain fill:#EDE9FE,stroke:#7C3AED,stroke-width:1.5px,color:#2E1065
+    classDef batch fill:#FEF3C7,stroke:#D97706,stroke-width:1.5px,color:#451A03
+    classDef store fill:#DCFCE7,stroke:#16A34A,stroke-width:1.5px,color:#052E16
+    classDef error fill:#FEE2E2,stroke:#DC2626,stroke-width:1.5px,color:#450A0A
 
-    RESULT -->|Valid Student| BUFFER
-    BUFFER -->|Batch Full: 1000 rows or EOF| UNIQ
-    UNIQ --> SPLIT
+    class CSV,FS,LOOP io
+    class CREATE,VALID domain
+    class BATCH,LOOKUP,UNIQ batch
+    class INSERT,DB store
+    class REPORT,ERRORS error
 
-    SPLIT -->|Duplicate in file or DB| ERR_WRITER
-    SPLIT -->|Unique Rows| BULK
-    BULK --> INNODB
+    style S1 fill:#F0F9FF,stroke:#7DD3FC,color:#0C4A6E
+    style S2 fill:#F5F3FF,stroke:#C4B5FD,color:#2E1065
+    style S3 fill:#FFFBEB,stroke:#FCD34D,color:#451A03
+    style S4 fill:#F0FDF4,stroke:#86EFAC,color:#052E16
+    style S5 fill:#FEF2F2,stroke:#FCA5A5,color:#450A0A
 
-    BULK -.->|Promise resolved: resumes stream| LOOP
-
-    classDef source fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
-    classDef domain fill:#0f172a,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
-    classDef error fill:#450a0a,stroke:#ef4444,stroke-width:2px,color:#fca5a5;
-    classDef batch fill:#1e1b4b,stroke:#06b6d4,stroke-width:2px,color:#f8fafc;
-    classDef storage fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#d1fae5;
-
-    class CSV,FS,PARSER,LOOP source;
-    class CREATE,VO_EMAIL,VO_NAME,VO_SCORE,RESULT domain;
-    class ERR_WRITER,ERR_FILE error;
-    class BUFFER,UNIQ,SPLIT batch;
-    class BULK,INNODB storage;
+    linkStyle 8,10 stroke:#16A34A,stroke-width:2px
+    linkStyle 9,11 stroke:#DC2626,stroke-width:2px
+    linkStyle 12 stroke:#D97706,stroke-width:2px,stroke-dasharray:6 4
 ```
 
 Memory is bounded by **one chunk + one batch**, whatever the file size (under 80 MB RSS — [ADR-004](docs/adr/004-memory-budget-and-heap-tuning.md)). Invalid rows never reach the database, and every rejected field is reported with its line number.
-*(Para os diagramas de sequência detalhados e mapa hexagonal de camadas, consulte [`docs/architecture.md`](docs/architecture.md)).*
+
+> 🔎 The backpressure sequence diagram, the HTTP job lifecycle and the layer map are detailed in
+> [`docs/architecture.md`](docs/architecture.md) (in Portuguese).
 
 ## 🏗️ Architecture
 
@@ -108,57 +111,75 @@ rule is **enforced by ESLint** (`no-restricted-imports` per layer: the Domain ca
 anything outside itself, the Application cannot import frameworks or outer layers).
 
 ```mermaid
-graph TD
-    subgraph PRESENTATION["Presentation Layer"]
-        CLI["CLI (Commander)<br/>import, migrate"]
-        HTTP["HTTP API (Express 5)<br/>POST /api/import, /health"]
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Inter, Segoe UI, Helvetica, Arial, sans-serif", "fontSize": "15px", "lineColor": "#64748B", "primaryTextColor": "#0F172A", "clusterBkg": "#F8FAFC", "clusterBorder": "#CBD5E1", "titleColor": "#0F172A", "edgeLabelBackground": "#FFFFFF"}, "flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 60, "padding": 14, "wrappingWidth": 260}}}%%
+flowchart LR
+    subgraph IN["🚪 Presentation · driving adapters"]
+        direction TB
+        CLI("CLI · commander<br/><i>import · migrate</i>")
+        HTTP("HTTP · Express 5<br/><i>upload · job status · /health</i>")
     end
 
-    subgraph INFRASTRUCTURE["Infrastructure Layer (Adapters)"]
-        DB_REPO["MySqlStudentRepository<br/>(Knex / mysql2)"]
-        CSV_READER["CsvParserStreamReader<br/>(fs.createReadStream)"]
-        REPORT_WRITER["CsvErrorReportWriter<br/>(Stream to disk)"]
-        PINO_LOG["Pino Logger<br/>(JSON structured)"]
-        QUEUE["InProcessImportJobQueue<br/>(Bounded concurrency)"]
+    subgraph APP["⚙️ Application · use cases"]
+        direction TB
+        UC1("ImportStudentsUseCase")
+        UC2("Start / ProcessImportJobUseCase")
+        UC3("GetImportJobStatus · CheckHealth")
     end
 
-    subgraph APPLICATION["Application Layer (Use Cases & Ports)"]
-        UC_IMPORT["ImportStudentsUseCase"]
-        UC_JOB["Start / ProcessImportJobUseCase"]
-        PORTS_REPO["StudentRepository (Port)"]
-        PORTS_CSV["CsvStreamReader (Port)"]
-        PORTS_WRITER["ErrorReportWriter (Port)"]
+    subgraph CORE["💎 Domain · zero dependencies"]
+        direction TB
+        D1["Student · ImportJob"]
+        D2["Email · StudentName · Score · FilePath"]
+        D3["StudentUniquenessService"]
+        D4["Result‹T, E› · DomainError"]
     end
 
-    subgraph DOMAIN["Domain Layer (Zero External Dependencies)"]
-        ENTITY["Entities: Student, ImportJob"]
-        VO["Value Objects: Email, StudentName, Score, FilePath"]
-        SERVICE["Services: StudentUniquenessService"]
-        RESULT["Shared: Result&lt;T, E&gt;"]
-        ERRORS["DomainError Hierarchy"]
+    subgraph PORTS["🔌 Ports · interfaces owned by the core"]
+        direction TB
+        P1["StudentRepository"]
+        P2["CsvStreamReader"]
+        P3["ErrorReportWriter"]
+        P4["ImportJobQueue"]
+        P5["Logger · Clock · IdGenerator"]
     end
 
-    CLI --> UC_IMPORT
-    HTTP --> UC_JOB
-    UC_IMPORT --> PORTS_REPO
-    UC_IMPORT --> PORTS_CSV
-    UC_IMPORT --> PORTS_WRITER
-    UC_IMPORT --> DOMAIN
-    UC_JOB --> DOMAIN
+    subgraph OUT["🔧 Infrastructure · driven adapters"]
+        direction TB
+        A1("MySqlStudentRepository<br/><i>knex · mysql2</i>")
+        A2("CsvParserStreamReader<br/><i>fs streams · csv-parser</i>")
+        A3("CsvErrorReportWriter<br/><i>streamed CSV</i>")
+        A4("InProcessImportJobQueue<br/><i>bounded concurrency</i>")
+        A5("pino · SystemClock · UUID v7")
+    end
 
-    DB_REPO -.->|implements| PORTS_REPO
-    CSV_READER -.->|implements| PORTS_CSV
-    REPORT_WRITER -.->|implements| PORTS_WRITER
+    CLI --> UC1
+    HTTP --> UC2
+    HTTP --> UC3
+    APP ==>|uses| CORE
+    APP -->|depends on| PORTS
+    P1 -.-|implemented by| A1
+    P2 -.- A2
+    P3 -.- A3
+    P4 -.- A4
+    P5 -.- A5
 
-    classDef pres fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
-    classDef infra fill:#1f2937,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
-    classDef app fill:#111827,stroke:#10b981,stroke-width:2px,color:#f8fafc;
-    classDef dom fill:#030712,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
+    classDef pres fill:#E0F2FE,stroke:#0284C7,stroke-width:1.5px,color:#0C4A6E
+    classDef app fill:#DCFCE7,stroke:#16A34A,stroke-width:1.5px,color:#052E16
+    classDef dom fill:#EDE9FE,stroke:#7C3AED,stroke-width:1.5px,color:#2E1065
+    classDef port fill:#FFFFFF,stroke:#7C3AED,stroke-width:1.5px,stroke-dasharray:4 3,color:#2E1065
+    classDef infra fill:#FEF3C7,stroke:#D97706,stroke-width:1.5px,color:#451A03
 
-    class CLI,HTTP pres;
-    class DB_REPO,CSV_READER,REPORT_WRITER,PINO_LOG,QUEUE infra;
-    class UC_IMPORT,UC_JOB,PORTS_REPO,PORTS_CSV,PORTS_WRITER app;
-    class ENTITY,VO,SERVICE,RESULT,ERRORS dom;
+    class CLI,HTTP pres
+    class UC1,UC2,UC3 app
+    class D1,D2,D3,D4 dom
+    class P1,P2,P3,P4,P5 port
+    class A1,A2,A3,A4,A5 infra
+
+    style IN fill:#F0F9FF,stroke:#7DD3FC,color:#0C4A6E
+    style APP fill:#F0FDF4,stroke:#86EFAC,color:#052E16
+    style CORE fill:#F5F3FF,stroke:#C4B5FD,color:#2E1065
+    style PORTS fill:#FAF5FF,stroke:#D8B4FE,color:#2E1065
+    style OUT fill:#FFFBEB,stroke:#FCD34D,color:#451A03
 ```
 
 ```
@@ -188,17 +209,17 @@ src/
     └── http/               # Express 5: streaming multipart upload, job status, /health
 ```
 
-### Key technical decisions & Architecture Decisions Records (ADRs)
+### Key technical decisions (ADRs)
 
-| Componente no Diagrama | Decisão Técnica | Rationale de Arquitetura | ADR Vinculado |
+| Pipeline stage | Decision | Rationale | ADR |
 |---|---|---|:---:|
-| **1. Ingestion** | Streams over `readFileSync` | Memória constante, Event Loop desimpedido, backpressure via `for await` | [ADR-001](docs/adr/001-streams-over-readfile.md) |
-| **2. Domain** | Result Pattern | Falhas esperadas retornadas como tipos discriminados seguros (`Result<T, E>`) em vez de exceptions | [ADR-003](docs/adr/003-result-pattern.md) |
-| **2. Domain** | Value Objects para Validação | Imutabilidade e garantia de invariantes antes de qualquer I/O de banco | — |
-| **4. Batching** | Lotes de 1.000 linhas | 99.9% menos round-trips que inserção linha a linha; default configurável | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
-| **4. Batching** | Unicidade com Memória $O(\text{batch})$ | Lookahead indexado de emails por lote sem guardar Set global de 500k itens | [ADR-005](docs/adr/005-email-uniqueness-with-bounded-memory.md) |
-| **5. Persistence** | UUID v7 (RFC 9562) | Chaves sequenciais no tempo preservando ordenação física no Clustered Index (InnoDB) sem page split | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
-| **Pipeline Global** | Heap Budget (`--max-old-space-size=64`) | Heap ativo de ~16 MB; V8 limitado mantém RSS < 80 MB com a mesma velocidade | [ADR-004](docs/adr/004-memory-budget-and-heap-tuning.md) |
+| **① Ingestion** | Streams over `readFileSync` | Flat memory, free Event Loop, backpressure via `for await` | [ADR-001](docs/adr/001-streams-over-readfile.md) |
+| **② Domain** | Result pattern | Expected failures are typed return values (`Result<T, E>`), not exceptions | [ADR-003](docs/adr/003-result-pattern.md) |
+| **② Domain** | Value Objects for validation | Immutable, invariants enforced before any database I/O | — |
+| **③ Batching** | Batches of 1,000 rows | 99.9 % fewer round-trips than row-by-row; configurable default | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
+| **③ Batching** | Uniqueness with O(batch) memory | One indexed email lookup per batch instead of a global `Set` of 500k emails | [ADR-005](docs/adr/005-email-uniqueness-with-bounded-memory.md) |
+| **④ Persistence** | UUID v7 primary keys (RFC 9562) | Time-ordered keys append to the end of the InnoDB clustered index (fewer page splits) | [ADR-002](docs/adr/002-bulk-insert-batch-size.md) |
+| **Whole process** | Heap budget (`--max-old-space-size=64`) | Live heap is ~16 MB; a capped V8 keeps RSS under 80 MB at the same speed | [ADR-004](docs/adr/004-memory-budget-and-heap-tuning.md) |
 
 ## 📊 Benchmarks
 
@@ -327,8 +348,8 @@ npm run test:coverage  # with coverage thresholds
 
 | Suite | What it covers |
 |---|---|
-| **Unit** (199 tests) | Value Objects, entities, domain service, every use case (happy path, partial failures, empty file, duplicates across batches, abort, DB/stream failures, **backpressure**), HTTP layer with fakes, queue, graceful shutdown, config |
-| **Integration** (19 tests) | `MySqlStudentRepository` + migrations on MySQL 8 (Testcontainers), CSV reader on real files (BOM, CRLF, quotes, oversized rows, early release of the file handle), error report writer |
+| **Unit** (205 tests) | Value Objects, entities, domain service, UUID v7 ordering properties, every use case (happy path, partial failures, empty file, duplicates across batches, abort, DB/stream failures, **backpressure**), HTTP layer with fakes, queue, graceful shutdown, config |
+| **Integration** (20 tests) | `MySqlStudentRepository` + migrations on MySQL 8 (Testcontainers), UUID v7 vs v4 physical ordering in InnoDB, CSV reader on real files (BOM, CRLF, quotes, oversized rows, early release of the file handle), error report writer |
 | **E2E** (6 tests) | Full import via the CLI command and via upload + job polling over HTTP; idempotent re-import |
 
 ### Coverage
@@ -351,6 +372,7 @@ npm run test:coverage  # with coverage thresholds
 | `npm run generate -- --rows 500000 [--error-rate 0.05] [--seed 42]` | Fake CSV generator (faker) |
 | `npm run seed` | Migrate + generate 10k rows + import them |
 | `npm run benchmark` | `readFileSync` vs `createReadStream` → `benchmarks/results.md` |
+| `npm run benchmark:uuid` | UUID v4 vs v7 insert throughput and clustered-index ordering (Testcontainers MySQL) |
 | `npm run lint` / `typecheck` / `format` | Quality gates |
 
 Configuration is read from the environment and validated with zod at startup — see
