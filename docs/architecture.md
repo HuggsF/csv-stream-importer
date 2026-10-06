@@ -42,24 +42,24 @@ flowchart TD
     end
 
     CSV --> FS
-    FS -->|Chunks de 64 KB| PARSER
-    PARSER -->|Async Iterable| LOOP
+    FS --> PARSER
+    PARSER --> LOOP
     LOOP --> CREATE
     CREATE -.-> VO_EMAIL & VO_NAME & VO_SCORE
     CREATE --> RESULT
 
-    RESULT -->|❌ Linha Inválida| ERR_WRITER
+    RESULT -->|Linha Invalida| ERR_WRITER
     ERR_WRITER --> ERR_FILE
 
-    RESULT -->|✅ Aluno Válido| BUFFER
-    BUFFER -->|Lote de 1.000 ou Fim do Arquivo| UNIQ
+    RESULT -->|Aluno Valido| BUFFER
+    BUFFER -->|Lote de 1000 ou Fim do Arquivo| UNIQ
     UNIQ --> SPLIT
 
-    SPLIT -->|❌ Duplicado no arquivo ou banco| ERR_WRITER
-    SPLIT -->|✅ Alunos Únicos| BULK
+    SPLIT -->|Duplicado no arquivo ou banco| ERR_WRITER
+    SPLIT -->|Alunos Unicos| BULK
     BULK --> INNODB
 
-    BULK -.->|await Promise resolve<br/>Retoma leitura do stream| LOOP
+    BULK -.->|Promise resolvida: retoma leitura| LOOP
 
     classDef source fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
     classDef domain fill:#0f172a,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;

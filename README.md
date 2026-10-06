@@ -35,10 +35,10 @@ three fronts:
 ```mermaid
 flowchart TD
     subgraph INGESTION["1. Stream Ingestion & Backpressure — ADR-001"]
-        CSV["📄 data/students.csv<br/>(500k rows / 48 MB)"]
-        FS["🌊 fs.createReadStream()<br/>(64 KB chunks on demand)"]
-        PARSER["⚙️ csv-parser (Transform Stream)<br/>(BOM, CRLF & quotes handled)"]
-        LOOP{"🔄 for await...of Loop<br/>(Automatic Backpressure)"}
+        CSV["📄 data/students.csv<br/>500k rows / 48 MB"]
+        FS["🌊 fs.createReadStream()<br/>64 KB chunks on demand"]
+        PARSER["⚙️ csv-parser (Transform Stream)<br/>BOM, CRLF & quotes handled"]
+        LOOP{"🔄 for await...of Loop<br/>Automatic Backpressure"}
     end
 
     subgraph DOMAIN["2. Domain Boundary & Validation — ADR-003"]
@@ -50,12 +50,12 @@ flowchart TD
     end
 
     subgraph ERROR_PIPELINE["3. Audit & Error Isolation"]
-        ERR_WRITER["📝 CsvErrorReportWriter<br/>(CSV-injection safe stream)"]
-        ERR_FILE[("🛑 output/errors-timestamp.csv<br/>(Line #, Field, Value, Reason)")]
+        ERR_WRITER["📝 CsvErrorReportWriter<br/>CSV-injection safe stream"]
+        ERR_FILE[("🛑 output/errors-timestamp.csv<br/>Line #, Field, Value, Reason")]
     end
 
     subgraph BATCHING["4. Batch Accumulation & Uniqueness — ADR-002 / ADR-005"]
-        BUFFER["📦 Memory Batch Buffer<br/>(Max 1,000 students — ADR-002)"]
+        BUFFER["📦 Memory Batch Buffer<br/>Max 1,000 students — ADR-002"]
         UNIQ["🔍 StudentUniquenessService<br/>SELECT email FROM students WHERE email IN (...) — ADR-005"]
         SPLIT{"Duplicate Check"}
     end
@@ -66,24 +66,24 @@ flowchart TD
     end
 
     CSV --> FS
-    FS -->|stream chunks| PARSER
-    PARSER -->|async iterable| LOOP
+    FS --> PARSER
+    PARSER --> LOOP
     LOOP --> CREATE
     CREATE -.-> VO_EMAIL & VO_NAME & VO_SCORE
     CREATE --> RESULT
 
-    RESULT -->|❌ Invalid Row| ERR_WRITER
+    RESULT -->|Invalid Row| ERR_WRITER
     ERR_WRITER --> ERR_FILE
 
-    RESULT -->|✅ Valid Student| BUFFER
-    BUFFER -->|Batch Full (1,000 rows) or EOF| UNIQ
+    RESULT -->|Valid Student| BUFFER
+    BUFFER -->|Batch Full: 1000 rows or EOF| UNIQ
     UNIQ --> SPLIT
 
-    SPLIT -->|❌ Duplicate in file / DB| ERR_WRITER
-    SPLIT -->|✅ Unique Rows| BULK
+    SPLIT -->|Duplicate in file or DB| ERR_WRITER
+    SPLIT -->|Unique Rows| BULK
     BULK --> INNODB
 
-    BULK -.->|await Promise resolves<br/>Resumes stream reading| LOOP
+    BULK -.->|Promise resolved: resumes stream| LOOP
 
     classDef source fill:#1e293b,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
     classDef domain fill:#0f172a,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
